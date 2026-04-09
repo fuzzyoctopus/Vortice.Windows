@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Vortice.Direct3D12\Vortice.Direct3D12.csproj" />
+    <ProjectReference Include="..\..\src\Vortice.Direct3D12MemoryAllocator\Vortice.Direct3D12MemoryAllocator.csproj" />
     <ProjectReference Include="..\..\src\Vortice.Dxc\Vortice.Dxc.csproj" />
     <ProjectReference Include="..\Vortice.SampleFramework\Vortice.SampleFramework.csproj" />
     

@@ -55,6 +55,7 @@
   <Project Path="src/Vortice.Direct2D1/Vortice.Direct2D1.csproj" />
   <Project Path="src/Vortice.Direct3D11/Vortice.Direct3D11.csproj" />
   <Project Path="src/Vortice.Direct3D12/Vortice.Direct3D12.csproj" />
+  <Project Path="src/Vortice.Direct3D12MemoryAllocator/Vortice.Direct3D12MemoryAllocator.csproj" />
   <Project Path="src/Vortice.Direct3D9/Vortice.Direct3D9.csproj" />
   <Project Path="src/Vortice.DirectComposition/Vortice.DirectComposition.csproj" />
   <Project Path="src/Vortice.DirectInput/Vortice.DirectInput.csproj" />
