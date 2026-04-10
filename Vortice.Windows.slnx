@@ -22,6 +22,7 @@
   </Folder>
   <Folder Name="/samples/Direct3D12/">
     <Project Path="samples/HelloDirect3D12/HelloDirect3D12.csproj" />
+    <Project Path="samples/HelloDirect3D12MemoryAllocator/HelloDirect3D12MemoryAllocator.csproj" />
     <Project Path="samples/HelloDirect3D12Raytracing/HelloDirect3D12Raytracing.csproj" />
   </Folder>
   <Folder Name="/samples/DirectML/">
