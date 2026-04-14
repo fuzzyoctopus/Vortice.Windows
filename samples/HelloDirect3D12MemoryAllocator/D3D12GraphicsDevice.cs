@@ -28,6 +28,7 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
 {
     private const int RenderLatency = 3;
     private const int TextureSize = 256;
+    private const int FragmentationCheckInterval = 60;
 
     private static readonly VertexPositionTexture[] CubeVertices =
     [
@@ -86,9 +87,9 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
     private readonly Allocation _indexBufferAllocation;
     private readonly IndexBufferView _indexBufferView;
     private readonly ID3D12InfoQueue1? _infoQueue1;
-    private readonly List<IDisposable> _initialUploadDisposables = [];
     private readonly ID3D12DescriptorHeap[] _mainDescriptorHeaps = new ID3D12DescriptorHeap[RenderLatency];
     private readonly Allocator _memoryAllocator;
+    private readonly UploadContext _uploadContext;
     private readonly Allocation[] _objectConstantAllocations = new Allocation[RenderLatency];
     private readonly IntPtr[] _objectConstantBufferData = new IntPtr[RenderLatency];
 
@@ -166,6 +167,7 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
         {
             _memoryAllocator = D3D12MA.CreateAllocator(new AllocatorDescription(Device, selectedAdapter));
         }
+        _uploadContext = new UploadContext(Device);
 
         using (IDXGIFactory5? factory5 = DXGIFactory.QueryInterfaceOrNull<IDXGIFactory5>())
         {
@@ -255,18 +257,50 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
 
         _commandList =
             Device.CreateCommandList<ID3D12GraphicsCommandList4>(CommandListType.Direct, _commandAllocators[0]);
+        // Close immediately — the copy queue owns the first open command list via UploadContext.
+        _commandList.Close();
 
-        CreateGeometryAndTextureResources(out _vertexBuffer, out _vertexBufferAllocation, out _vertexBufferView,
-            out _indexBuffer, out _indexBufferAllocation, out _indexBufferView, out _texture, out _textureAllocation);
+        // Begin the copy batch on the dedicated copy queue.
+        _uploadContext.Begin();
 
+        CreateGeometryAndTextureResources(
+            out _vertexBuffer, out _vertexBufferAllocation, out _vertexBufferView,
+            out _indexBuffer, out _indexBufferAllocation, out _indexBufferView,
+            out _texture, out _textureAllocation,
+            out ID3D12Resource vertexUpload, out Allocation vertexUploadAllocation,
+            out ID3D12Resource indexUpload,  out Allocation indexUploadAllocation,
+            out ID3D12Resource textureUpload, out Allocation textureUploadAllocation);
+
+        // Submit all copies on the copy queue.
+        ulong copyFence = _uploadContext.Submit();
+
+        // Queue staging resources for deferred release once the copy fence is reached.
+        // Resource is passed before its Allocation in each pair (correct disposal order).
+        _uploadContext.DeferRelease(copyFence,
+            vertexUpload, vertexUploadAllocation,
+            indexUpload,  indexUploadAllocation,
+            textureUpload, textureUploadAllocation);
+
+        // Insert a GPU-side wait into the graphics queue BEFORE submitting the barrier pass.
+        _uploadContext.SyncGraphicsQueue(GraphicsQueue, copyFence);
+
+        // Record post-copy barriers on the graphics command list (Common → target states).
+        _commandList.Reset(_commandAllocators[0], null);
+        _commandList.ResourceBarrierTransition(
+            _vertexBuffer, ResourceStates.Common, ResourceStates.VertexAndConstantBuffer);
+        _commandList.ResourceBarrierTransition(
+            _indexBuffer, ResourceStates.Common, ResourceStates.IndexBuffer);
+        _commandList.ResourceBarrierTransition(
+            _texture, ResourceStates.Common, ResourceStates.PixelShaderResource);
         _commandList.Close();
         GraphicsQueue.ExecuteCommandList(_commandList);
 
         _frameFence = Device.CreateFence();
         _frameFenceEvent = new AutoResetEvent(false);
 
+        // CPU-wait until the barrier pass completes; safe to start DrawFrame after this.
         WaitIdle();
-        DisposeInitialUploadResources();
+        // Staging resources freed lazily by ProcessDeferredDeletions() in DrawFrame.
     }
 
     public bool IsTearingSupported { get; }
@@ -276,6 +310,14 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
     public bool DrawFrame(Action<int, int> draw, [CallerMemberName] string? frameName = null)
     {
         int frame = (int)_frameIndex;
+
+        // Advance D3D12MA frame index for budget tracking (monotonic counter, not modulo slot).
+        _memoryAllocator.SetCurrentFrameIndex((uint)_frameCount);
+
+        // Check for heap fragmentation every 60 frames.
+        if (_frameCount % FragmentationCheckInterval == 0)
+            CheckFragmentation();
+
         UpdateConstantBuffers(frame);
 
         _commandAllocators[frame].Reset();
@@ -343,12 +385,18 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
 
         _frameIndex = _frameCount % RenderLatency;
         _backbufferIndex = SwapChain.CurrentBackBufferIndex;
+
+        _uploadContext.ProcessDeferredDeletions();
         return true;
     }
 
     public void Dispose()
     {
         WaitIdle();
+
+        // UploadContext.Dispose() calls Flush() internally, draining any remaining
+        // staging resources before releasing D3D12 objects.
+        _uploadContext.Dispose();
 
         for (int i = 0; i < RenderLatency; i++)
         {
@@ -626,7 +674,13 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
         out Allocation indexBufferAllocation,
         out IndexBufferView indexBufferView,
         out ID3D12Resource texture,
-        out Allocation textureAllocation)
+        out Allocation textureAllocation,
+        out ID3D12Resource vertexUpload,
+        out Allocation vertexUploadAllocation,
+        out ID3D12Resource indexUpload,
+        out Allocation indexUploadAllocation,
+        out ID3D12Resource textureUpload,
+        out Allocation textureUploadAllocation)
     {
         ulong vertexBufferSize = (ulong)(CubeVertices.Length * sizeof(VertexPositionTexture));
         ulong indexBufferSize = (ulong)(CubeIndices.Length * sizeof(ushort));
@@ -634,37 +688,34 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
         vertexBuffer = _memoryAllocator.CreateResource(
             AllocationDescription.Default(HeapType.Default),
             ResourceDescription.Buffer(vertexBufferSize),
-            ResourceStates.CopyDest,
+            ResourceStates.Common,
             out vertexBufferAllocation);
         vertexBuffer.Name = "Vertex Buffer";
 
-        ID3D12Resource vertexUpload = _memoryAllocator.CreateResource(
+        vertexUpload = _memoryAllocator.CreateResource(
             AllocationDescription.Default(HeapType.Upload),
             ResourceDescription.Buffer(vertexBufferSize),
             ResourceStates.GenericRead,
-            out Allocation vertexUploadAllocation);
+            out vertexUploadAllocation);
         vertexUpload.SetData(CubeVertices);
 
-        _commandList.CopyBufferRegion(vertexBuffer, 0, vertexUpload, 0, vertexBufferSize);
-        _commandList.ResourceBarrierTransition(vertexBuffer, ResourceStates.CopyDest,
-            ResourceStates.VertexAndConstantBuffer);
+        _uploadContext.CommandList.CopyBufferRegion(vertexBuffer, 0, vertexUpload, 0, vertexBufferSize);
 
         indexBuffer = _memoryAllocator.CreateResource(
             AllocationDescription.Default(HeapType.Default),
             ResourceDescription.Buffer(indexBufferSize),
-            ResourceStates.CopyDest,
+            ResourceStates.Common,
             out indexBufferAllocation);
         indexBuffer.Name = "Index Buffer";
 
-        ID3D12Resource indexUpload = _memoryAllocator.CreateResource(
+        indexUpload = _memoryAllocator.CreateResource(
             AllocationDescription.Default(HeapType.Upload),
             ResourceDescription.Buffer(indexBufferSize),
             ResourceStates.GenericRead,
-            out Allocation indexUploadAllocation);
+            out indexUploadAllocation);
         indexUpload.SetData(CubeIndices);
 
-        _commandList.CopyBufferRegion(indexBuffer, 0, indexUpload, 0, indexBufferSize);
-        _commandList.ResourceBarrierTransition(indexBuffer, ResourceStates.CopyDest, ResourceStates.IndexBuffer);
+        _uploadContext.CommandList.CopyBufferRegion(indexBuffer, 0, indexUpload, 0, indexBufferSize);
 
         vertexBufferView = new VertexBufferView(vertexBuffer.GPUVirtualAddress, (uint)vertexBufferSize,
             (uint)sizeof(VertexPositionTexture));
@@ -674,24 +725,46 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
         texture = _memoryAllocator.CreateResource(
             AllocationDescription.Default(HeapType.Default),
             ResourceDescription.Texture2D(Format.R8G8B8A8_UNorm, TextureSize, TextureSize),
-            ResourceStates.CopyDest,
+            ResourceStates.Common,
             out textureAllocation);
         texture.Name = "Checkerboard Texture";
 
-        ulong textureUploadSize = texture.GetRequiredIntermediateSize(0, 1);
-        ID3D12Resource textureUpload = _memoryAllocator.CreateResource(
+        ResourceDescription textureDesc = ResourceDescription.Texture2D(Format.R8G8B8A8_UNorm, TextureSize, TextureSize);
+
+        PlacedSubresourceFootPrint[] footprints = new PlacedSubresourceFootPrint[1];
+        uint[] numRowsArr = new uint[1];
+        ulong[] rowSizesArr = new ulong[1];
+        Device.GetCopyableFootprints(textureDesc, 0, 1, 0, footprints, numRowsArr, rowSizesArr, out ulong uploadSize);
+
+        PlacedSubresourceFootPrint footprint = footprints[0];
+        uint numRows = numRowsArr[0];
+        ulong rowSizeInBytes = rowSizesArr[0];
+
+        textureUpload = _memoryAllocator.CreateResource(
             AllocationDescription.Default(HeapType.Upload),
-            ResourceDescription.Buffer(textureUploadSize),
+            ResourceDescription.Buffer(uploadSize),
             ResourceStates.GenericRead,
-            out Allocation textureUploadAllocation);
+            out textureUploadAllocation);
 
-        fixed (byte* textureDataPtr = textureData)
+        void* mappedTexture;
+        textureUpload.Map(0, null, &mappedTexture).CheckError();
+        byte* texDst = (byte*)mappedTexture + footprint.Offset;
+        fixed (byte* texSrc = textureData)
         {
-            SubresourceData subresourceData = new(textureDataPtr, TextureSize * 4, TextureSize * TextureSize * 4);
-            _commandList.UpdateSubresources(texture, textureUpload, 0, 0, 1, &subresourceData);
+            uint srcRowPitch = TextureSize * 4u; // tightly-packed RGBA source, 4 bytes per pixel
+            for (uint row = 0; row < numRows; row++)
+            {
+                Buffer.MemoryCopy(
+                    texSrc + row * srcRowPitch,
+                    texDst + row * footprint.Footprint.RowPitch,
+                    rowSizeInBytes, rowSizeInBytes);
+            }
         }
+        textureUpload.Unmap(0, null);
 
-        _commandList.ResourceBarrierTransition(texture, ResourceStates.CopyDest, ResourceStates.PixelShaderResource);
+        TextureCopyLocation texDstLoc = new(texture, 0);
+        TextureCopyLocation texSrcLoc = new(textureUpload, footprint);
+        _uploadContext.CommandList.CopyTextureRegion(texDstLoc, 0, 0, 0, texSrcLoc, null);
 
         for (int i = 0; i < RenderLatency; i++)
         {
@@ -699,13 +772,6 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
                 _cbvSrvDescriptorSize);
             Device.CreateShaderResourceView(texture, null, srvHandle);
         }
-
-        _initialUploadDisposables.Add(textureUploadAllocation);
-        _initialUploadDisposables.Add(textureUpload);
-        _initialUploadDisposables.Add(indexUploadAllocation);
-        _initialUploadDisposables.Add(indexUpload);
-        _initialUploadDisposables.Add(vertexUploadAllocation);
-        _initialUploadDisposables.Add(vertexUpload);
     }
 
     private void UpdateConstantBuffers(int frame)
@@ -737,6 +803,26 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
         Unsafe.Write((byte*)_objectConstantBufferData[frame] + _objectConstantBufferStride, cube2Constants);
     }
 
+    private void CheckFragmentation()
+    {
+        _memoryAllocator.CalculateStatistics(out TotalStatistics stats);
+        ref DetailedStatistics total = ref stats.Total;
+
+        if (total.Stats.BlockBytes == 0)
+            return;
+
+        double fragmentation = 1.0 - (double)total.Stats.AllocationBytes
+                                    / total.Stats.BlockBytes;
+
+        if (fragmentation > 0.20)
+        {
+            Debug.WriteLine(
+                $"[D3D12MA] Fragmentation warning: {fragmentation:P1} " +
+                $"(alloc={total.Stats.AllocationBytes / 1024.0:F1}KB, " +
+                $"block={total.Stats.BlockBytes / 1024.0:F1}KB)");
+        }
+    }
+
     private static byte[] CreateCheckerboardTexture(int width, int height)
     {
         byte[] data = new byte[width * height * 4];
@@ -753,16 +839,6 @@ public sealed unsafe class D3D12GraphicsDevice : IGraphicsDevice
         }
 
         return data;
-    }
-
-    private void DisposeInitialUploadResources()
-    {
-        foreach (IDisposable disposable in _initialUploadDisposables)
-        {
-            disposable.Dispose();
-        }
-
-        _initialUploadDisposables.Clear();
     }
 
     private static void DebugCallback(MessageCategory category, MessageSeverity severity, MessageId id,
