@@ -261,3 +261,6 @@ launchSettings.json
 
 #Rider
 .idea
+
+# Git worktrees
+.worktrees/
