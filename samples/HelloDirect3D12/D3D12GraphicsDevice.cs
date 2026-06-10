@@ -15,6 +15,7 @@ using Vortice.Dxc;
 using Vortice;
 using Vortice.DXGI.Debug;
 using System.Runtime.InteropServices;
+using Vortice.Direct3D12MemoryAllocator;
 
 namespace HelloDirect3D12;
 
@@ -29,6 +30,9 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
     private readonly ID3D12DescriptorHeap _rtvDescriptorHeap;
     private readonly uint _rtvDescriptorSize;
     private readonly ID3D12Resource[] _renderTargets;
+    private readonly Allocator? _memoryAllocator;
+    private readonly Allocation? _depthStencilAllocation;
+    private readonly Allocation? _vertexBufferAllocation;
 
     private readonly Format _depthStencilFormat;
     private readonly ID3D12Resource? _depthStencilTexture;
@@ -50,10 +54,11 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
     private uint _backbufferIndex;
 
     public bool UseRenderPass { get; set; } = true;
+    public bool UseMemoryAllocator { get; }
 
     public static bool IsSupported() => D3D12.IsSupported(FeatureLevel.Level_12_0);
 
-    public D3D12GraphicsDevice(bool validation, Window window, Format depthStencilFormat = Format.D32_Float)
+    public D3D12GraphicsDevice(bool validation, Window window, bool useMemoryAllocator = false, Format depthStencilFormat = Format.D32_Float)
     {
         if (!IsSupported())
         {
@@ -61,6 +66,7 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
         }
 
         Window = window;
+        UseMemoryAllocator = useMemoryAllocator;
         _depthStencilFormat = depthStencilFormat;
 
         if (validation
@@ -74,7 +80,8 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
             validation = false;
         }
 
-        if (D3D12GetDebugInterface(out ID3D12DeviceRemovedExtendedDataSettings1? dredSettings).Success)
+        if (D3D12GetDebugInterface(out ID3D12DeviceRemovedExtendedDataSettings1? dredSettings).Success
+            && dredSettings is not null)
         {
             // Turn on auto-breadcrumbs and page fault reporting.
             dredSettings.SetAutoBreadcrumbsEnablement(DredEnablement.ForcedOn);
@@ -87,10 +94,16 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
         DXGIFactory = CreateDXGIFactory2<IDXGIFactory4>(validation);
 
         ID3D12Device2? d3d12Device = default;
+        IDXGIAdapter1? selectedAdapter = null;
         for (uint adapterIndex = 0;
             DXGIFactory.EnumAdapters1(adapterIndex, out IDXGIAdapter1? adapter).Success;
             adapterIndex++)
         {
+            if (adapter is null)
+            {
+                continue;
+            }
+
             AdapterDescription1 desc = adapter.Description1;
 
             // Don't select the Basic Render Driver adapter.
@@ -102,9 +115,11 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
 
             if (D3D12CreateDevice(adapter, FeatureLevel.Level_11_0, out d3d12Device).Success)
             {
-                adapter.Dispose();
+                selectedAdapter = adapter;
                 break;
             }
+
+            adapter.Dispose();
         }
 
         using (IDXGIFactory5? factory5 = DXGIFactory.QueryInterfaceOrNull<IDXGIFactory5>())
@@ -115,12 +130,25 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
             }
         }
 
-        if (d3d12Device == null)
+        if (d3d12Device == null || selectedAdapter is null)
         {
             throw new PlatformNotSupportedException("Cannot create ID3D12Device");
         }
 
-        Device = d3d12Device!;
+        Device = d3d12Device;
+
+        try
+        {
+            if (UseMemoryAllocator)
+            {
+                AllocatorDescription allocatorDescription = new(Device, selectedAdapter);
+                _memoryAllocator = D3D12MA.CreateAllocator(allocatorDescription);
+            }
+        }
+        finally
+        {
+            selectedAdapter.Dispose();
+        }
 
         _infoQueue1 = Device.QueryInterfaceOrNull<ID3D12InfoQueue1>();
 
@@ -167,11 +195,25 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
 
             ClearValue depthOptimizedClearValue = new ClearValue(_depthStencilFormat, 1.0f, 0);
 
-            _depthStencilTexture = Device.CreateCommittedResource(
-                HeapType.Default,
-                depthStencilDesc,
-                ResourceStates.DepthWrite,
-                depthOptimizedClearValue);
+            if (_memoryAllocator != null)
+            {
+                _depthStencilTexture = _memoryAllocator.CreateResource(
+                    AllocationDescription.Default(HeapType.Default),
+                    depthStencilDesc,
+                    ResourceStates.DepthWrite,
+                    out Allocation depthStencilAllocation,
+                    depthOptimizedClearValue);
+                _depthStencilAllocation = depthStencilAllocation;
+            }
+            else
+            {
+                _depthStencilTexture = Device.CreateCommittedResource(
+                    HeapType.Default,
+                    depthStencilDesc,
+                    ResourceStates.DepthWrite,
+                    depthOptimizedClearValue);
+            }
+
             _depthStencilTexture.Name = "DepthStencil Texture";
 
             DepthStencilViewDescription dsViewDesc = new()
@@ -270,10 +312,22 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
 
         ulong vertexBufferSize = 3 * (ulong)sizeof(VertexPositionColor);
 
-        _vertexBuffer = Device.CreateCommittedResource(
-            HeapType.Upload,
-            ResourceDescription.Buffer(vertexBufferSize),
-            ResourceStates.GenericRead);
+        if (_memoryAllocator != null)
+        {
+            _vertexBuffer = _memoryAllocator.CreateResource(
+                AllocationDescription.Default(HeapType.Upload),
+                ResourceDescription.Buffer(vertexBufferSize),
+                ResourceStates.GenericRead,
+                out Allocation vertexBufferAllocation);
+            _vertexBufferAllocation = vertexBufferAllocation;
+        }
+        else
+        {
+            _vertexBuffer = Device.CreateCommittedResource(
+                HeapType.Upload,
+                ResourceDescription.Buffer(vertexBufferSize),
+                ResourceStates.GenericRead);
+        }
 
         ReadOnlySpan<VertexPositionColor> triangleVertices =
         [
@@ -300,6 +354,7 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
         WaitIdle();
 
         _vertexBuffer.Dispose();
+        _vertexBufferAllocation?.Dispose();
 
         for (int i = 0; i < RenderLatency; i++)
         {
@@ -309,6 +364,7 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
         _commandList.Dispose();
 
         _depthStencilTexture?.Dispose();
+        _depthStencilAllocation?.Dispose();
         _dsvDescriptorHeap?.Dispose();
         _rtvDescriptorHeap.Dispose();
         _pipelineState.Dispose();
@@ -316,6 +372,7 @@ public sealed unsafe partial class D3D12GraphicsDevice : IGraphicsDevice
         SwapChain.Dispose();
         _frameFence.Dispose();
         GraphicsQueue.Dispose();
+        _memoryAllocator?.Dispose();
 
         if (_infoQueue1 != null)
         {

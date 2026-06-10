@@ -11,7 +11,7 @@
     <ProjectReference Include="..\..\src\Vortice.Direct3D12MemoryAllocator\Vortice.Direct3D12MemoryAllocator.csproj" />
     <ProjectReference Include="..\..\src\Vortice.Dxc\Vortice.Dxc.csproj" />
     <ProjectReference Include="..\Vortice.SampleFramework\Vortice.SampleFramework.csproj" />
-    
+
     <Content Include="Assets\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
